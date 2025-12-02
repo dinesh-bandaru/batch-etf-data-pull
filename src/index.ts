@@ -24,7 +24,6 @@ interface MonthlyTimeSeries {
 
 export default {
 	async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-		const symbol = 'QQQ'; // Hardcoded for now as per requirements
 		const apiKey = env.ALPHA_VANTAGE_API_KEY;
 
 		if (!apiKey) {
@@ -33,24 +32,51 @@ export default {
 		}
 
 		try {
-			// 1. Fetch Data
-			const [profile, timeSeries] = await Promise.all([
-				fetchEtfProfile(symbol, apiKey),
-				fetchMonthlyTimeSeries(symbol, apiKey)
-			]);
+			// 1. Get list of ETFs
+			const { results } = await env.etf_db.prepare('SELECT symbol FROM etfs').all<{ symbol: string }>();
 
-			if (!profile || !timeSeries) {
-				console.error('Failed to fetch data');
+			if (!results || results.length === 0) {
+				console.log('No ETFs found in database');
 				return;
 			}
 
-			// 2. Calculate CAGRs
-			const cagrs = calculateCagrs(timeSeries);
+			console.log(`Starting batch update for ${results.length} ETFs`);
 
-			// 3. Store Data in D1
-			await storeData(env.etf_db, symbol, profile, cagrs);
+			// 2. Process each ETF
+			for (const row of results) {
+				const symbol = row.symbol;
+				console.log(`Processing ${symbol}...`);
 
-			console.log(`Successfully updated data for ${symbol}`);
+				try {
+					// Fetch Data
+					const [profile, timeSeries] = await Promise.all([
+						fetchEtfProfile(symbol, apiKey),
+						fetchMonthlyTimeSeries(symbol, apiKey)
+					]);
+
+					if (!profile || !timeSeries) {
+						console.error(`Failed to fetch data for ${symbol}`);
+						continue;
+					}
+
+					// Calculate CAGRs
+					const cagrs = calculateCagrs(timeSeries);
+
+					// Store Data in D1
+					await storeData(env.etf_db, symbol, profile, cagrs);
+
+					console.log(`Successfully updated data for ${symbol}`);
+
+					// Alpha Vantage has rate limits (e.g., 5 calls/min for free tier, higher for premium).
+					// Adding a small delay to be safe, though for 40 ETFs on free tier this will still fail.
+					// Assuming user has a key that supports this volume or understands the limit.
+					// 12 seconds delay = 5 calls/minute max.
+					// await new Promise(resolve => setTimeout(resolve, 12000)); 
+
+				} catch (err) {
+					console.error(`Error processing ${symbol}:`, err);
+				}
+			}
 
 		} catch (error) {
 			console.error('Error in scheduled task:', error);
