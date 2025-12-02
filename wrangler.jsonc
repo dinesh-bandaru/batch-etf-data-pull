@@ -42,7 +42,15 @@
 	// "services": [{ "binding": "MY_SERVICE", "service": "my-service" }]
 	"triggers": {
 		"crons": [
-			"* * * * *"
+			"0 0 * * 1"
 		]
-	}
+	},
+	"d1_databases": [
+		{
+			"binding": "etf_db",
+			"database_name": "etf-db",
+			"database_id": "f5f55c0f-bea9-433c-8724-bd9cba675823",
+			"remote": true
+		}
+	]
 }

@@ -1,40 +1,140 @@
-/**
- * Welcome to Cloudflare Workers!
- *
- * This is a template for a Scheduled Worker: a Worker that can run on a
- * configurable interval:
- * https://developers.cloudflare.com/workers/platform/triggers/cron-triggers/
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Run `curl "http://localhost:8787/__scheduled?cron=*+*+*+*+*"` to see your Worker in action
- * - Run `npm run deploy` to publish your Worker
- *
- * Bind resources to your Worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
+interface Env {
+	etf_db: D1Database;
+	ALPHA_VANTAGE_API_KEY: string;
+}
+
+interface EtfProfile {
+	net_expense_ratio: string;
+	holdings: {
+		symbol: string;
+		weight: string;
+	}[];
+}
+
+interface MonthlyTimeSeries {
+	"Meta Data": {
+		"2. Symbol": string;
+	};
+	"Monthly Adjusted Time Series": {
+		[date: string]: {
+			"5. adjusted close": string;
+		};
+	};
+}
 
 export default {
-	async fetch(req) {
-		const url = new URL(req.url);
-		url.pathname = '/__scheduled';
-		url.searchParams.append('cron', '* * * * *');
-		return new Response(`To test the scheduled handler, ensure you have used the "--test-scheduled" then try running "curl ${url.href}".`);
-	},
+	async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+		const symbol = 'QQQ'; // Hardcoded for now as per requirements
+		const apiKey = env.ALPHA_VANTAGE_API_KEY;
 
-	// The scheduled handler is invoked at the interval set in our wrangler.jsonc's
-	// [[triggers]] configuration.
-	async scheduled(event, env, ctx): Promise<void> {
-		// A Cron Trigger can make requests to other endpoints on the Internet,
-		// publish to a Queue, query a D1 Database, and much more.
-		//
-		// We'll keep it simple and make an API call to a Cloudflare API:
-		let resp = await fetch('https://api.cloudflare.com/client/v4/ips');
-		let wasSuccessful = resp.ok ? 'success' : 'fail';
+		if (!apiKey) {
+			console.error('ALPHA_VANTAGE_API_KEY is not set');
+			return;
+		}
 
-		// You could store this result in KV, write to a D1 Database, or publish to a Queue.
-		// In this template, we'll just log the result:
-		console.log(`trigger fired at ${event.cron}: ${wasSuccessful}`);
+		try {
+			// 1. Fetch Data
+			const [profile, timeSeries] = await Promise.all([
+				fetchEtfProfile(symbol, apiKey),
+				fetchMonthlyTimeSeries(symbol, apiKey)
+			]);
+
+			if (!profile || !timeSeries) {
+				console.error('Failed to fetch data');
+				return;
+			}
+
+			// 2. Calculate CAGRs
+			const cagrs = calculateCagrs(timeSeries);
+
+			// 3. Store Data in D1
+			await storeData(env.etf_db, symbol, profile, cagrs);
+
+			console.log(`Successfully updated data for ${symbol}`);
+
+		} catch (error) {
+			console.error('Error in scheduled task:', error);
+		}
 	},
-} satisfies ExportedHandler<Env>;
+};
+
+async function fetchEtfProfile(symbol: string, apiKey: string): Promise<EtfProfile | null> {
+	const url = `https://www.alphavantage.co/query?function=ETF_PROFILE&symbol=${symbol}&apikey=${apiKey}`;
+	const response = await fetch(url);
+	if (!response.ok) {
+		console.error(`Error fetching ETF profile: ${response.statusText}`);
+		return null;
+	}
+	return await response.json() as EtfProfile;
+}
+
+async function fetchMonthlyTimeSeries(symbol: string, apiKey: string): Promise<MonthlyTimeSeries | null> {
+	const url = `https://www.alphavantage.co/query?function=TIME_SERIES_MONTHLY_ADJUSTED&symbol=${symbol}&apikey=${apiKey}`;
+	const response = await fetch(url);
+	if (!response.ok) {
+		console.error(`Error fetching time series: ${response.statusText}`);
+		return null;
+	}
+	return await response.json() as MonthlyTimeSeries;
+}
+
+function calculateCagrs(data: MonthlyTimeSeries) {
+	const timeSeries = data["Monthly Adjusted Time Series"];
+	const dates = Object.keys(timeSeries).sort((a, b) => new Date(b).getTime() - new Date(a).getTime());
+
+	if (dates.length === 0) return { cagr1yr: 0, cagr3yr: 0, cagr5yr: 0 };
+
+	const latestDate = dates[0];
+	const latestPrice = parseFloat(timeSeries[latestDate]["5. adjusted close"]);
+
+	const getPriceYearsAgo = (years: number) => {
+		// Approximate months
+		const targetIndex = years * 12;
+		if (targetIndex >= dates.length) return null;
+
+		const targetDate = dates[targetIndex];
+		return parseFloat(timeSeries[targetDate]["5. adjusted close"]);
+	};
+
+	const calculateCagr = (years: number) => {
+		const pastPrice = getPriceYearsAgo(years);
+		if (!pastPrice) return 0;
+		return Math.pow(latestPrice / pastPrice, 1 / years) - 1;
+	};
+
+	return {
+		cagr1yr: calculateCagr(1),
+		cagr3yr: calculateCagr(3),
+		cagr5yr: calculateCagr(5)
+	};
+}
+
+async function storeData(db: D1Database, symbol: string, profile: EtfProfile, cagrs: { cagr1yr: number, cagr3yr: number, cagr5yr: number }) {
+	// 1. Upsert Fundamentals
+	await db.prepare(`
+		INSERT INTO etf_fundamentals (etf, expense_ratio, "1yr_cagr", "3yr_cagr", "5yr_cagr")
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(etf) DO UPDATE SET
+			expense_ratio = excluded.expense_ratio,
+			"1yr_cagr" = excluded."1yr_cagr",
+			"3yr_cagr" = excluded."3yr_cagr",
+			"5yr_cagr" = excluded."5yr_cagr"
+	`).bind(
+		symbol,
+		parseFloat(profile.net_expense_ratio),
+		cagrs.cagr1yr,
+		cagrs.cagr3yr,
+		cagrs.cagr5yr
+	).run();
+
+	// 2. Replace Holdings
+	// Transaction would be better here, but D1 batching is good enough for now
+	await db.prepare('DELETE FROM etf_holdings WHERE etf = ?').bind(symbol).run();
+
+	const stmt = db.prepare('INSERT INTO etf_holdings (etf, holding, weight) VALUES (?, ?, ?)');
+	const batch = profile.holdings.map(h => stmt.bind(symbol, h.symbol, parseFloat(h.weight)));
+
+	if (batch.length > 0) {
+		await db.batch(batch);
+	}
+}
