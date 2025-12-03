@@ -32,8 +32,9 @@ export default {
 		}
 
 		try {
-			// 1. Get list of ETFs
-			const { results } = await env.etf_db.prepare('SELECT symbol FROM etfs').all<{ symbol: string }>();
+			// 1. Get list of ETFs (Rolling Batch: Oldest 5)
+			// COALESCE(last_updated, 0) ensures nulls (never updated) come first
+			const { results } = await env.etf_db.prepare('SELECT symbol FROM etfs ORDER BY COALESCE(last_updated, 0) ASC LIMIT 5').all<{ symbol: string }>();
 
 			if (!results || results.length === 0) {
 				console.log('No ETFs found in database');
@@ -64,6 +65,11 @@ export default {
 
 					// Store Data in D1
 					await storeData(env.etf_db, symbol, profile, cagrs);
+
+					// Update last_updated timestamp
+					await env.etf_db.prepare('UPDATE etfs SET last_updated = ? WHERE symbol = ?')
+						.bind(Date.now(), symbol)
+						.run();
 
 					console.log(`Successfully updated data for ${symbol}`);
 
